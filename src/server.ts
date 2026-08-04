@@ -133,6 +133,9 @@ const CreateElementSchema = z.object({
   }).optional(),
   fontSize: z.number().optional(),
   fontFamily: z.union([z.string(), z.number()]).optional(),
+  // Bound-text back-pointer — without it, zod strips containerId on import
+  // and re-imported bound labels detach from their containers
+  containerId: z.string().nullable().optional(),
   groupIds: z.array(z.string()).optional(),
   locked: z.boolean().optional(),
   roundness: z.object({ type: z.number(), value: z.number().optional() }).nullable().optional(),
@@ -189,6 +192,9 @@ const UpdateElementSchema = z.object({
   }).optional(),
   fontSize: z.number().optional(),
   fontFamily: z.union([z.string(), z.number()]).optional(),
+  // Bound-text back-pointer — without it, zod strips containerId on import
+  // and re-imported bound labels detach from their containers
+  containerId: z.string().nullable().optional(),
   groupIds: z.array(z.string()).optional(),
   locked: z.boolean().optional(),
   roundness: z.object({ type: z.number(), value: z.number().optional() }).nullable().optional(),

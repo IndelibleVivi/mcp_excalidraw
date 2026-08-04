@@ -9,15 +9,21 @@ import {
 } from './canvas-client.js';
 import { sanitizeFilePath } from './normalize.js';
 import { isObsidianExcalidrawMd, extractSceneJsonFromObsidianMd } from './obsidian-md.js';
+import { expandElementsForExport } from './expand-elements.js';
 
 export interface ExportedScene {
   scene: Record<string, any>;
   elementCount: number;
 }
 
-// Build a .excalidraw scene JSON from the current canvas state
+// Build a .excalidraw scene JSON from the current canvas state.
+// Elements are expanded from the agent format (label/start/end) into real
+// Excalidraw elements (bound text pairs, arrow bindings) so the file renders
+// fully on excalidraw.com and in the Obsidian Excalidraw plugin — with
+// deterministic ids/seeds so re-exporting an unchanged scene is byte-stable.
 export async function buildSceneFile(): Promise<ExportedScene> {
   const sceneElements = await getElements();
+  const exportElements = expandElementsForExport(sceneElements, { deterministic: true });
 
   // Fetch files for image elements
   let sceneFiles: Record<string, any> = {};
@@ -29,7 +35,7 @@ export async function buildSceneFile(): Promise<ExportedScene> {
     type: 'excalidraw',
     version: 2,
     source: 'mcp-excalidraw-server',
-    elements: sceneElements,
+    elements: exportElements,
     appState: {
       viewBackgroundColor: '#ffffff',
       gridSize: null
@@ -37,7 +43,7 @@ export async function buildSceneFile(): Promise<ExportedScene> {
     ...(Object.keys(sceneFiles).length > 0 ? { files: sceneFiles } : {})
   };
 
-  return { scene: excalidrawScene, elementCount: sceneElements.length };
+  return { scene: excalidrawScene, elementCount: exportElements.length };
 }
 
 export interface ImportResult {
