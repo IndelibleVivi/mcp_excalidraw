@@ -14,7 +14,9 @@
 // re-saves stay block-reference-compatible.
 
 const ID_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-const BLOCK_ID_RE = /^[A-Za-z0-9_-]{1,8}$/;
+// Obsidian block ids are alphanumeric-and-dash only — an id containing "_"
+// would be written as an unresolvable block reference, so rename those too.
+const BLOCK_ID_RE = /^[A-Za-z0-9-]{1,8}$/;
 
 export function isObsidianExcalidrawMd(content: string): boolean {
   // Raw scene JSON always starts with { or [ — never treat it as markdown,
@@ -24,15 +26,30 @@ export function isObsidianExcalidrawMd(content: string): boolean {
   return content.includes('# Excalidraw Data') || /^---[\s\S]*?excalidraw-plugin:/m.test(content);
 }
 
-function nanoid8(used: Set<string>): string {
-  let id: string;
-  do {
-    id = Array.from(
-      { length: 8 },
-      () => ID_ALPHABET[Math.floor(Math.random() * ID_ALPHABET.length)]
-    ).join('');
-  } while (used.has(id));
-  return id;
+// FNV-1a 32-bit hash — stable positive int from a string
+function fnv1a(str: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+// Deterministic 8-char block id derived from the original element id, so
+// re-exporting the same scene produces the same block ids and links from
+// other vault notes stay intact across exports.
+function stableId8(sourceId: string, used: Set<string>): string {
+  for (let attempt = 0; ; attempt++) {
+    const salted = attempt === 0 ? sourceId : `${sourceId}:${attempt}`;
+    let bits = (BigInt(fnv1a(salted)) << 32n) | BigInt(fnv1a(`${salted}#2`));
+    let id = '';
+    for (let i = 0; i < 8; i++) {
+      id += ID_ALPHABET[Number(bits % BigInt(ID_ALPHABET.length))];
+      bits /= BigInt(ID_ALPHABET.length);
+    }
+    if (!used.has(id)) return id;
+  }
 }
 
 function renameElementId(elements: any[], oldId: string, newId: string): void {
@@ -63,7 +80,7 @@ export function wrapSceneAsObsidianMd(scene: Record<string, any>): string {
   for (const el of wrapped.elements) {
     if (el.type !== 'text' || el.isDeleted) continue;
     if (!BLOCK_ID_RE.test(el.id)) {
-      const newId = nanoid8(used);
+      const newId = stableId8(el.id, used);
       used.add(newId);
       renameElementId(wrapped.elements, el.id, newId);
     }
