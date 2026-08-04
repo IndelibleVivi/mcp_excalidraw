@@ -17,6 +17,25 @@ export interface ExpandOptions {
   deterministic?: boolean;
 }
 
+// Canonical key order for exported elements: identity/geometry first, the
+// rest alphabetical — so a no-op import→export cycle is byte-identical and
+// committed .excalidraw files produce minimal git diffs.
+const KEY_ORDER = ['id', 'type', 'x', 'y', 'width', 'height'];
+function canonicalizeKeys(v: any): any {
+  if (Array.isArray(v)) return v.map(canonicalizeKeys);
+  if (v && typeof v === 'object') {
+    const keys = Object.keys(v).sort((a, b) => {
+      const ia = KEY_ORDER.indexOf(a); const ib = KEY_ORDER.indexOf(b);
+      if (ia !== -1 || ib !== -1) return (ia === -1 ? KEY_ORDER.length : ia) - (ib === -1 ? KEY_ORDER.length : ib);
+      return a < b ? -1 : 1;
+    });
+    const out: Record<string, any> = {};
+    for (const k of keys) out[k] = canonicalizeKeys(v[k]);
+    return out;
+  }
+  return v;
+}
+
 // FNV-1a 32-bit hash — stable positive int from a string
 function fnv1a(str: string): number {
   let h = 0x811c9dc5;
@@ -36,6 +55,9 @@ export function expandElementsForExport(
     deterministic ? (fnv1a(key) % 2147483646) + 1 : Math.floor(Math.random() * 2147483647);
   const updatedFor = (el: any): number => {
     if (!deterministic) return Date.now();
+    // Prefer a preserved `updated` (re-imported scene) over the server's
+    // updatedAt, so no-op import→export cycles are byte-identical.
+    if (typeof el.updated === 'number') return el.updated;
     const parsed = Date.parse(el.updatedAt ?? el.createdAt ?? '');
     return Number.isNaN(parsed) ? 1 : parsed;
   };
@@ -250,5 +272,5 @@ export function expandElementsForExport(
   // Append all bound text elements after their parents
   cleanedExportElements.push(...boundTextElements);
 
-  return cleanedExportElements;
+  return deterministic ? canonicalizeKeys(cleanedExportElements) : cleanedExportElements;
 }
