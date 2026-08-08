@@ -21,7 +21,7 @@ export interface ExpandOptions {
 // rest alphabetical — so a no-op import→export cycle is byte-identical and
 // committed .excalidraw files produce minimal git diffs.
 const KEY_ORDER = ['id', 'type', 'x', 'y', 'width', 'height'];
-function canonicalizeKeys(v: any): any {
+export function canonicalizeKeys(v: any): any {
   if (Array.isArray(v)) return v.map(canonicalizeKeys);
   if (v && typeof v === 'object') {
     const keys = Object.keys(v).sort((a, b) => {

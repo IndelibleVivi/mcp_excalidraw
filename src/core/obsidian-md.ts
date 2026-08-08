@@ -13,6 +13,8 @@
 // every scene reference rewired — so files we write and files the plugin
 // re-saves stay block-reference-compatible.
 
+import { canonicalizeKeys } from './expand-elements.js';
+
 const ID_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 // Obsidian block ids are alphanumeric-and-dash only — an id containing "_"
 // would be written as an unresolvable block reference, so rename those too.
@@ -104,7 +106,7 @@ ${textSection}
 %%
 ## Drawing
 \`\`\`json
-${JSON.stringify(wrapped, null, '\t')}
+${JSON.stringify(canonicalizeKeys(wrapped), null, '\t')}
 \`\`\`
 %%`;
 }
@@ -113,14 +115,18 @@ export function extractSceneJsonFromObsidianMd(md: string): string {
   // The closing fence must sit at the start of a line: element text can
   // contain ``` inside the JSON strings, but a line of pretty-printed JSON
   // never begins with a backtick (this mirrors the plugin's own DRAWING_REG).
-  const compressed = md.match(/\n##? Drawing\n[^`]*```compressed-json\n([\s\S]*?)\n```/);
+  //
+  // Every line break matches `\r?\n`: files authored on Windows (or by the
+  // Obsidian plugin there) use CRLF, and requiring a bare `\n` made every
+  // such file fail with a misleading "No Drawing block found".
+  const compressed = md.match(/\r?\n##? Drawing\r?\n[^`]*```compressed-json\r?\n([\s\S]*?)\r?\n```/);
   if (compressed) {
     const json = decompressFromBase64(compressed[1]!.replace(/\s/g, ''));
     if (!json) throw new Error('Failed to decompress the Drawing block');
     JSON.parse(json);
     return json;
   }
-  const plain = md.match(/\n##? Drawing\n[^`]*```json\n([\s\S]*?)\n```/);
+  const plain = md.match(/\r?\n##? Drawing\r?\n[^`]*```json\r?\n([\s\S]*?)\r?\n```/);
   if (plain) {
     JSON.parse(plain[1]!);
     return plain[1]!;
