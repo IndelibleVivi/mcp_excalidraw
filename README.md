@@ -1,5 +1,17 @@
 # Excalidraw MCP Server, CLI & Agent Skill
 
+> [!IMPORTANT]
+> This is an **unofficial community reliability fork** of
+> [`yctimlin/mcp_excalidraw`](https://github.com/yctimlin/mcp_excalidraw), maintained from
+> real multi-tab and restart-recovery use. It preserves the upstream MIT license and
+> authorship while adding optional durable canvas checkpoints, scene revision compare-and-swap,
+> stale-tab conflict recovery, and browser draft restoration. See [UPSTREAM.md](UPSTREAM.md)
+> for the exact lineage and maintenance boundary.
+>
+> The unscoped npm package and GHCR images referenced in the upstream documentation below
+> are still upstream releases and **do not yet contain this fork's reliability changes**.
+> To use the fork today, follow [Using This Fork](#using-this-fork) and build from source.
+
 [![CI](https://github.com/yctimlin/mcp_excalidraw/actions/workflows/ci.yml/badge.svg)](https://github.com/yctimlin/mcp_excalidraw/actions/workflows/ci.yml)
 [![Docker Build & Push](https://github.com/yctimlin/mcp_excalidraw/actions/workflows/docker.yml/badge.svg)](https://github.com/yctimlin/mcp_excalidraw/actions/workflows/docker.yml)
 [![NPM Version](https://img.shields.io/npm/v/mcp-excalidraw-server)](https://www.npmjs.com/package/mcp-excalidraw-server)
@@ -27,6 +39,7 @@ Core drawing runs fully local (Node ≥ 20, MIT licensed) — no API keys. Merma
 - [What It Is](#what-it-is)
 - [How We Differ from the Official Excalidraw MCP](#how-we-differ-from-the-official-excalidraw-mcp)
 - [What's New](#whats-new)
+- [Using This Fork](#using-this-fork)
 - [Installation](#installation)
 - [Agent Skill](#agent-skill)
 - [CLI Reference](#cli-reference)
@@ -104,6 +117,43 @@ Current package version: **2.0.0**. The current release line is **v2.0 — Inter
 - **Skill is now CLI-first** and no longer needs a cloned repo or configured MCP server to work.
 - **Typed queries**: `query --filter locked=true --filter label.text=API` — booleans, numbers, and nested keys work.
 - **Internals**: shared core library (`src/core/`) behind both the CLI and MCP server; canvas `groupIds` are the source of truth for grouping (ungroup now works across restarts); `node-fetch` dropped; MCP version metadata derived from `package.json`; canvas server writes a pidfile and shuts down cleanly.
+
+## Using This Fork
+
+Until a separately named scoped package is released, install this fork from source. The ordinary
+`npx -y mcp-excalidraw-server ...` commands install the upstream npm package, not this fork.
+
+```bash
+git clone https://github.com/IndelibleVivi/mcp_excalidraw.git
+cd mcp_excalidraw
+npm ci
+npm run build
+
+# Optional but recommended: keep accepted canvas state across restarts.
+EXCALIDRAW_DATA_DIR="$(pwd)/../mcp-excalidraw-data" node dist/bin.js start
+node dist/bin.js status
+```
+
+For an MCP client, point its stdio command at the built source checkout and keep the durable data
+directory outside repositories or shared folders:
+
+```json
+{
+  "mcpServers": {
+    "excalidraw": {
+      "command": "node",
+      "args": ["/absolute/path/to/mcp_excalidraw/dist/index.js"],
+      "env": {
+        "EXCALIDRAW_DATA_DIR": "/absolute/private/path/excalidraw-data"
+      }
+    }
+  }
+}
+```
+
+Run `npm test` after pulling updates. The fork-specific suite covers atomic checkpoints, restart
+recovery, state epochs, scene revision conflicts, single-writer locking, failed-write rollback,
+files, snapshots, and element version preservation.
 
 ## Installation
 
@@ -239,7 +289,7 @@ Set `EXCALIDRAW_DATA_DIR` to keep elements, image files, named snapshots, and th
 
 ```bash
 EXCALIDRAW_DATA_DIR=/absolute/private/canvas-data \
-  npx -y mcp-excalidraw-server start
+  node dist/bin.js start
 ```
 
 The directory contains `canvas-state-v1.json` and a single-owner `canvas-state.lock`. It is created at startup, and a second canvas-server process cannot use the same directory concurrently. Each accepted mutation writes a sibling temporary file, flushes it, and atomically renames it over the checkpoint before the API acknowledges the change. A missing checkpoint starts as an empty canvas. Invalid JSON or an unsupported checkpoint schema stops startup instead of silently replacing recoverable state with an empty scene. Network filesystems and multiple writers are not supported.
@@ -469,6 +519,8 @@ Viewport group focus can tune framing with `viewportZoomFactor`:
 From source (Node >= 20):
 
 ```bash
+git clone https://github.com/IndelibleVivi/mcp_excalidraw.git
+cd mcp_excalidraw
 npm ci
 npm run build
 PORT=3000 npm run canvas          # canvas server (terminal 1)
@@ -476,7 +528,10 @@ node dist/index.js                # MCP server over stdio (terminal 2, usually l
 node dist/bin.js status           # or drive the CLI straight from the build
 ```
 
-Docker canvas server:
+The following Docker images are upstream release artifacts and do not yet include this fork's
+durable-state and stale-write changes.
+
+Upstream Docker canvas server:
 ```bash
 docker run -d -p 3000:3000 --name mcp-excalidraw-canvas ghcr.io/yctimlin/mcp_excalidraw-canvas:latest
 ```
