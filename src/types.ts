@@ -146,6 +146,8 @@ export interface ServerElement extends Omit<ExcalidrawElementBase, 'id'> {
 // API Response types
 export interface ApiResponse<T = any> {
   success: boolean;
+  stateId?: string;
+  sceneRevision?: number;
   data?: T;
   error?: string;
   message?: string;
@@ -170,6 +172,8 @@ export interface SyncResponse extends ApiResponse {
 // WebSocket message types
 export interface WebSocketMessage {
   type: WebSocketMessageType;
+  stateId?: string;
+  sceneRevision?: number;
   [key: string]: any;
 }
 

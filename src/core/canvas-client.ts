@@ -5,6 +5,8 @@ import { EXPRESS_SERVER_URL, ENABLE_CANVAS_SYNC } from './config.js';
 // API Response types
 export interface ApiResponse {
   success: boolean;
+  stateId?: string;
+  sceneRevision?: number;
   element?: ServerElement;
   elements?: ServerElement[];
   message?: string;
@@ -348,6 +350,9 @@ export interface HealthStatus {
   timestamp: string;
   elements_count: number;
   websocket_clients: number;
+  state_id?: string;
+  scene_revision?: number;
+  durable_state_enabled?: boolean;
   // Identity fields (v1.1+); `stop` requires both before signaling anything
   service?: string;
   pid?: number;

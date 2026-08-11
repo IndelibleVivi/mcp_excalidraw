@@ -30,6 +30,20 @@ import { z } from 'zod';
 import WebSocket from 'ws';
 import { isMainModule } from './core/entry.js';
 import { writePidFile, removePidFile } from './core/pidfile.js';
+import {
+  CanvasPersistenceError,
+  acquireDurableStateLock,
+  commitCanvasMutation,
+  durableStatePath,
+  getSceneRevision,
+  getStateId,
+  loadDurableState,
+  releaseDurableStateLock,
+} from './core/canvas-persistence.js';
+
+function mutationErrorStatus(error: unknown, fallback: number): number {
+  return error instanceof CanvasPersistenceError ? 500 : fallback;
+}
 
 // Load environment variables
 dotenv.config();
@@ -58,6 +72,10 @@ app.use('/assets/fonts', express.static(
 // WebSocket connections
 const clients = new Set<WebSocket>();
 
+function currentFiles(): Record<string, ExcalidrawFile> {
+  return Object.fromEntries(files.entries());
+}
+
 // Broadcast to all connected clients
 function broadcast(message: WebSocketMessage): void {
   const data = JSON.stringify(message);
@@ -85,11 +103,12 @@ wss.on('connection', (ws: WebSocket) => {
   logger.info('New WebSocket connection established');
 
   // Send current elements to new client
-  const filesObj: Record<string, ExcalidrawFile> = {};
-  files.forEach((f, id) => { filesObj[id] = f; });
+  const filesObj = currentFiles();
   const initialMessage: InitialElementsMessage & { files?: Record<string, ExcalidrawFile> } = {
     type: 'initial_elements',
     elements: Array.from(elements.values()),
+    stateId: getStateId(),
+    sceneRevision: getSceneRevision(),
     ...(files.size > 0 ? { files: filesObj } : {})
   };
   ws.send(JSON.stringify(initialMessage));
@@ -98,7 +117,9 @@ wss.on('connection', (ws: WebSocket) => {
   const syncMessage: SyncStatusMessage = {
     type: 'sync_status',
     elementCount: elements.size,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    stateId: getStateId(),
+    sceneRevision: getSceneRevision()
   };
   ws.send(JSON.stringify(syncMessage));
 
@@ -249,6 +270,20 @@ const UpdateElementSchema = z.object({
 
 // API Routes
 
+// Read the versioned scene atomically. Conflict recovery must not combine
+// elements from one revision with files from another.
+app.get('/api/scene', (_req: Request, res: Response) => {
+  const sceneElements = Array.from(elements.values());
+  res.json({
+    success: true,
+    elements: sceneElements,
+    files: currentFiles(),
+    count: sceneElements.length,
+    stateId: getStateId(),
+    sceneRevision: getSceneRevision()
+  });
+});
+
 // Get all elements
 app.get('/api/elements', (req: Request, res: Response) => {
   try {
@@ -256,7 +291,9 @@ app.get('/api/elements', (req: Request, res: Response) => {
     res.json({
       success: true,
       elements: elementsArray,
-      count: elementsArray.length
+      count: elementsArray.length,
+      stateId: getStateId(),
+      sceneRevision: getSceneRevision()
     });
   } catch (error) {
     logger.error('Error fetching elements:', error);
@@ -284,27 +321,32 @@ app.post('/api/elements', (req: Request, res: Response) => {
       version: 1
     };
 
-    // Resolve arrow bindings against existing elements
-    if (element.type === 'arrow' || element.type === 'line') {
-      resolveArrowBindings([element]);
-    }
-
-    elements.set(id, element);
+    const { sceneRevision } = commitCanvasMutation(() => {
+      // Resolve arrow bindings against existing elements
+      if (element.type === 'arrow' || element.type === 'line') {
+        resolveArrowBindings([element]);
+      }
+      elements.set(id, element);
+    });
 
     // Broadcast to all connected clients
     const message: ElementCreatedMessage = {
       type: 'element_created',
-      element: element
+      element: element,
+      stateId: getStateId(),
+      sceneRevision
     };
     broadcast(message);
 
     res.json({
       success: true,
-      element: element
+      element: element,
+      stateId: getStateId(),
+      sceneRevision
     });
   } catch (error) {
     logger.error('Error creating element:', error);
-    res.status(400).json({
+    res.status(mutationErrorStatus(error, 400)).json({
       success: false,
       error: (error as Error).message
     });
@@ -365,31 +407,37 @@ app.put('/api/elements/:id', (req: Request, res: Response) => {
       }
     }
 
-    elements.set(id, updatedElement);
-
-    // Broadcast to all connected clients
-    const message: ElementUpdatedMessage = {
-      type: 'element_updated',
-      element: updatedElement
-    };
-    broadcast(message);
-
     // Moving/resizing a shape must drag its bound arrows along
     const geometryChanged = ['x', 'y', 'width', 'height']
       .some(key => Object.prototype.hasOwnProperty.call(body, key));
-    if (geometryChanged && updatedElement.type !== 'arrow' && updatedElement.type !== 'line') {
-      for (const arrow of rerouteBoundArrows(id)) {
-        broadcast({ type: 'element_updated', element: arrow } as ElementUpdatedMessage);
-      }
+    const { value: reroutedArrows, sceneRevision } = commitCanvasMutation(() => {
+      elements.set(id, updatedElement);
+      return geometryChanged && updatedElement.type !== 'arrow' && updatedElement.type !== 'line'
+        ? rerouteBoundArrows(id)
+        : [];
+    });
+
+    // Broadcast only after the mutation has been checkpointed successfully.
+    const message: ElementUpdatedMessage = {
+      type: 'element_updated',
+      element: updatedElement,
+      stateId: getStateId(),
+      sceneRevision
+    };
+    broadcast(message);
+    for (const arrow of reroutedArrows) {
+      broadcast({ type: 'element_updated', element: arrow, stateId: getStateId(), sceneRevision } as ElementUpdatedMessage);
     }
 
     res.json({
       success: true,
-      element: updatedElement
+      element: updatedElement,
+      stateId: getStateId(),
+      sceneRevision
     });
   } catch (error) {
     logger.error('Error updating element:', error);
-    res.status(400).json({
+    res.status(mutationErrorStatus(error, 400)).json({
       success: false,
       error: (error as Error).message
     });
@@ -400,11 +448,13 @@ app.put('/api/elements/:id', (req: Request, res: Response) => {
 app.delete('/api/elements/clear', (req: Request, res: Response) => {
   try {
     const count = elements.size;
-    elements.clear();
+    const { sceneRevision } = commitCanvasMutation(() => elements.clear());
 
     broadcast({
       type: 'canvas_cleared',
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      stateId: getStateId(),
+      sceneRevision
     });
 
     logger.info(`Canvas cleared: ${count} elements removed`);
@@ -412,7 +462,9 @@ app.delete('/api/elements/clear', (req: Request, res: Response) => {
     res.json({
       success: true,
       message: `Cleared ${count} elements`,
-      count
+      count,
+      stateId: getStateId(),
+      sceneRevision
     });
   } catch (error) {
     logger.error('Error clearing canvas:', error);
@@ -442,18 +494,22 @@ app.delete('/api/elements/:id', (req: Request, res: Response) => {
       });
     }
 
-    elements.delete(id);
+    const { sceneRevision } = commitCanvasMutation(() => elements.delete(id));
 
     // Broadcast to all connected clients
     const message: ElementDeletedMessage = {
       type: 'element_deleted',
-      elementId: id!
+      elementId: id!,
+      stateId: getStateId(),
+      sceneRevision
     };
     broadcast(message);
 
     res.json({
       success: true,
-      message: `Element ${id} deleted successfully`
+      message: `Element ${id} deleted successfully`,
+      stateId: getStateId(),
+      sceneRevision
     });
   } catch (error) {
     logger.error('Error deleting element:', error);
@@ -712,27 +768,33 @@ app.post('/api/elements/batch', (req: Request, res: Response) => {
       createdElements.push(element);
     });
 
-    // Resolve arrow bindings (computes positions, startBinding, endBinding, boundElements)
-    resolveArrowBindings(createdElements);
+    const { sceneRevision } = commitCanvasMutation(() => {
+      // Resolve arrow bindings (computes positions, startBinding, endBinding, boundElements)
+      resolveArrowBindings(createdElements);
 
-    // Store all elements after binding resolution
-    createdElements.forEach(el => elements.set(el.id, el));
+      // Store all elements after binding resolution
+      createdElements.forEach(el => elements.set(el.id, el));
+    });
 
     // Broadcast to all connected clients
     const message: BatchCreatedMessage = {
       type: 'elements_batch_created',
-      elements: createdElements
+      elements: createdElements,
+      stateId: getStateId(),
+      sceneRevision
     };
     broadcast(message);
 
     res.json({
       success: true,
       elements: createdElements,
-      count: createdElements.length
+      count: createdElements.length,
+      stateId: getStateId(),
+      sceneRevision
     });
   } catch (error) {
     logger.error('Error batch creating elements:', error);
-    res.status(400).json({
+    res.status(mutationErrorStatus(error, 400)).json({
       success: false,
       error: (error as Error).message
     });
@@ -783,12 +845,7 @@ app.post('/api/elements/from-mermaid', (req: Request, res: Response) => {
 // Sync elements from frontend (overwrite sync)
 app.post('/api/elements/sync', (req: Request, res: Response) => {
   try {
-    const { elements: frontendElements, timestamp } = req.body;
-
-    logger.info(`Sync request received: ${frontendElements.length} elements`, {
-      timestamp,
-      elementCount: frontendElements.length
-    });
+    const { elements: frontendElements, timestamp, baseRevision, baseStateId } = req.body ?? {};
 
     // Validate input data
     if (!Array.isArray(frontendElements)) {
@@ -797,51 +854,99 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
         error: 'Expected elements to be an array'
       });
     }
+    if (baseRevision === undefined || baseStateId === undefined) {
+      return res.status(428).json({
+        success: false,
+        code: 'SCENE_PRECONDITION_REQUIRED',
+        error: 'baseStateId and baseRevision are required for full-scene sync',
+        stateId: getStateId(),
+        sceneRevision: getSceneRevision()
+      });
+    }
+    if (!Number.isSafeInteger(baseRevision) || baseRevision < 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'baseRevision must be a non-negative integer',
+        stateId: getStateId(),
+        sceneRevision: getSceneRevision()
+      });
+    }
+    if (typeof baseStateId !== 'string' || baseStateId.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'baseStateId must be a non-empty string',
+        stateId: getStateId(),
+        sceneRevision: getSceneRevision()
+      });
+    }
+
+    logger.info(`Sync request received: ${frontendElements.length} elements`, {
+      timestamp,
+      baseStateId,
+      baseRevision,
+      elementCount: frontendElements.length
+    });
+
+    const currentRevision = getSceneRevision();
+    const currentStateId = getStateId();
+    if (baseStateId !== currentStateId || baseRevision !== currentRevision) {
+      const authoritativeElements = Array.from(elements.values());
+      return res.status(409).json({
+        success: false,
+        code: 'SCENE_REVISION_CONFLICT',
+        baseStateId,
+        baseRevision,
+        error: 'Canvas changed since this client last loaded it',
+        elements: authoritativeElements,
+        files: currentFiles(),
+        count: authoritativeElements.length,
+        stateId: currentStateId,
+        sceneRevision: currentRevision
+      });
+    }
 
     // Record element count before sync
     const beforeCount = elements.size;
-
-    // 1. Clear existing memory storage
-    elements.clear();
-    logger.info(`Cleared existing elements: ${beforeCount} elements removed`);
-
-    // 2. Batch write new data
-    let successCount = 0;
     const processedElements: ServerElement[] = [];
+    const { sceneRevision } = commitCanvasMutation(() => {
+      elements.clear();
 
-    frontendElements.forEach((element: any, index: number) => {
-      try {
-        // Ensure element has ID, generate one if missing
-        const elementId = element.id || generateId();
-
-        // Add server metadata
-        const processedElement: ServerElement = {
-          ...element,
-          id: elementId,
-          syncedAt: new Date().toISOString(),
-          source: 'frontend_sync',
-          syncTimestamp: timestamp,
-          version: 1
-        };
-
-        // Store to memory
-        elements.set(elementId, processedElement);
-        processedElements.push(processedElement);
-        successCount++;
-
-      } catch (elementError) {
-        logger.warn(`Failed to process element ${index}:`, elementError);
-      }
+      frontendElements.forEach((element: any, index: number) => {
+        try {
+          const elementId = element.id || generateId();
+          const processedElement: ServerElement = {
+            ...element,
+            id: elementId,
+            syncedAt: new Date().toISOString(),
+            source: 'frontend_sync',
+            syncTimestamp: timestamp,
+            version: Number.isSafeInteger(element.version) && element.version > 0
+              ? element.version
+              : 1
+          };
+          elements.set(elementId, processedElement);
+          processedElements.push(processedElement);
+        } catch (elementError) {
+          logger.warn(`Failed to process element ${index}:`, elementError);
+        }
+      });
     });
 
-    logger.info(`Sync completed: ${successCount}/${frontendElements.length} elements synced`);
+    const successCount = processedElements.length;
+    logger.info(`Sync completed: ${successCount}/${frontendElements.length} elements synced`, { sceneRevision });
 
-    // 3. Broadcast sync event to all WebSocket clients
+    // Every tab receives the authoritative replacement, not only the new
+    // revision. Otherwise a second tab could pair a fresh revision with its
+    // stale elements and pass the next compare-and-swap check.
     broadcast({
       type: 'elements_synced',
+      elements: processedElements,
+      files: currentFiles(),
       count: successCount,
       timestamp: new Date().toISOString(),
-      source: 'manual_sync'
+      source: 'manual_sync',
+      stateId: getStateId(),
+      sceneRevision
     });
 
     // 4. Return sync results
@@ -851,7 +956,9 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
       count: successCount,
       syncedAt: new Date().toISOString(),
       beforeCount,
-      afterCount: elements.size
+      afterCount: elements.size,
+      stateId: getStateId(),
+      sceneRevision
     });
 
   } catch (error) {
@@ -867,31 +974,36 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
 // ─── Files API (for image elements) ───────────────────────────
 // GET all files
 app.get('/api/files', (_req: Request, res: Response) => {
-  const filesObj: Record<string, ExcalidrawFile> = {};
-  files.forEach((f, id) => { filesObj[id] = f; });
-  res.json({ files: filesObj });
+  res.json({
+    files: currentFiles(),
+    stateId: getStateId(),
+    sceneRevision: getSceneRevision()
+  });
 });
 
 // POST add/update files (batch)
 app.post('/api/files', (req: Request, res: Response) => {
   const body = req.body;
   const fileList: ExcalidrawFile[] = Array.isArray(body) ? body : (body?.files || []);
-  for (const f of fileList) {
-    if (f.id && f.dataURL) {
-      files.set(f.id, { id: f.id, dataURL: f.dataURL, mimeType: f.mimeType || 'image/png', created: f.created || Date.now() });
+  const { sceneRevision } = commitCanvasMutation(() => {
+    for (const f of fileList) {
+      if (f.id && f.dataURL) {
+        files.set(f.id, { id: f.id, dataURL: f.dataURL, mimeType: f.mimeType || 'image/png', created: f.created || Date.now() });
+      }
     }
-  }
+  });
   // Broadcast files to connected clients
-  broadcast({ type: 'files_added', files: fileList });
-  res.json({ success: true, count: fileList.length });
+  broadcast({ type: 'files_added', files: fileList, stateId: getStateId(), sceneRevision });
+  res.json({ success: true, count: fileList.length, stateId: getStateId(), sceneRevision });
 });
 
 // DELETE a file
 app.delete('/api/files/:id', (req: Request, res: Response) => {
   const id = req.params.id as string;
-  if (files.delete(id)) {
-    broadcast({ type: 'file_deleted', fileId: id });
-    res.json({ success: true });
+  if (files.has(id)) {
+    const { sceneRevision } = commitCanvasMutation(() => files.delete(id));
+    broadcast({ type: 'file_deleted', fileId: id, stateId: getStateId(), sceneRevision });
+    res.json({ success: true, stateId: getStateId(), sceneRevision });
   } else {
     res.status(404).json({ success: false, error: `File with ID ${id} not found` });
   }
@@ -1196,14 +1308,19 @@ app.post('/api/snapshots', (req: Request, res: Response) => {
       createdAt: new Date().toISOString()
     };
 
-    snapshots.set(name, snapshot);
+    const { sceneRevision } = commitCanvasMutation(
+      () => snapshots.set(name, snapshot),
+      { advanceSceneRevision: false }
+    );
     logger.info(`Snapshot saved: "${name}" with ${snapshot.elements.length} elements`);
 
     res.json({
       success: true,
       name,
       elementCount: snapshot.elements.length,
-      createdAt: snapshot.createdAt
+      createdAt: snapshot.createdAt,
+      stateId: getStateId(),
+      sceneRevision
     });
   } catch (error) {
     logger.error('Error saving snapshot:', error);
@@ -1281,6 +1398,9 @@ app.get('/health', (req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
     elements_count: elements.size,
     websocket_clients: clients.size,
+    state_id: getStateId(),
+    scene_revision: getSceneRevision(),
+    durable_state_enabled: Boolean(durableStatePath()),
     // Identity for `stop`: it must only ever signal a process that both
     // identifies as this service AND self-reports its pid — never a pid
     // from a stale pidfile or an unrelated app squatting on the port.
@@ -1294,6 +1414,9 @@ app.get('/api/sync/status', (req: Request, res: Response) => {
   res.json({
     success: true,
     elementCount: elements.size,
+    stateId: getStateId(),
+    sceneRevision: getSceneRevision(),
+    durableStateEnabled: Boolean(durableStatePath()),
     timestamp: new Date().toISOString(),
     memoryUsage: {
       heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024), // MB
@@ -1359,10 +1482,35 @@ server.on('error', (error: NodeJS.ErrnoException) => {
   } else {
     logger.error('Failed to start canvas server:', error);
   }
+  try {
+    releaseDurableStateLock();
+  } catch (releaseError) {
+    logger.error('Failed to release canvas data directory lock:', releaseError);
+  }
   process.exit(1);
 });
 
 async function startServer(): Promise<void> {
+  acquireDurableStateLock();
+
+  let durableState: ReturnType<typeof loadDurableState>;
+  try {
+    durableState = loadDurableState();
+  } catch (error) {
+    releaseDurableStateLock();
+    throw error;
+  }
+  if (durableState.loaded) {
+    logger.info('Loaded durable canvas state', {
+      sceneRevision: durableState.sceneRevision,
+      elements: durableState.elements,
+      files: durableState.files,
+      snapshots: durableState.snapshots
+    });
+  } else if (durableState.enabled) {
+    logger.info('Durable canvas state enabled; starting without an existing checkpoint');
+  }
+
   if (LOOPBACK_GUARD_HOSTS.has(HOST)) {
     const existingHost = await findExistingLoopbackListener(PORT);
     if (existingHost) {
@@ -1371,6 +1519,7 @@ async function startServer(): Promise<void> {
         `${formatHostForUrl(existingHost)}:${PORT} is already listening. ` +
         'This prevents duplicate IPv4/IPv6 canvas servers from splitting state.'
       );
+      releaseDurableStateLock();
       process.exit(1);
     }
   }
@@ -1394,7 +1543,10 @@ async function startServer(): Promise<void> {
   const shutdown = (signal: NodeJS.Signals): void => {
     logger.info(`Received ${signal}, shutting down canvas server`);
     if (ownsPidFile) removePidFile(PORT);
-    server.close(() => process.exit(0));
+    server.close(() => {
+      releaseDurableStateLock();
+      process.exit(0);
+    });
     // Force-exit if open sockets keep the server from closing promptly
     setTimeout(() => process.exit(0), 2000).unref();
   };
@@ -1402,6 +1554,11 @@ async function startServer(): Promise<void> {
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('exit', () => {
     if (ownsPidFile) removePidFile(PORT);
+    try {
+      releaseDurableStateLock();
+    } catch {
+      // The process is already exiting; startup/shutdown logged any actionable error.
+    }
   });
 }
 
@@ -1409,7 +1566,10 @@ async function startServer(): Promise<void> {
 // (`node dist/server.js`, `npm run canvas`, or spawned by the CLI/MCP
 // auto-start). Importing this module must never start the server.
 if (isMainModule(import.meta.url)) {
-  void startServer();
+  void startServer().catch(error => {
+    logger.error('Failed to start canvas server:', error);
+    process.exit(1);
+  });
 }
 
 export { startServer };

@@ -64,7 +64,7 @@ Excalidraw has an [official MCP](https://github.com/excalidraw/excalidraw-mcp) �
 | | Official Excalidraw MCP | This Project |
 |---|---|---|
 | **Approach** | Prompt in, diagram out (one-shot widget) | Programmatic element-level control (CLI + 26 MCP tools) |
-| **State** | Checkpoints inside the chat widget | Persistent live canvas with real-time sync |
+| **State** | Checkpoints inside the chat widget | Live canvas with real-time sync and optional restart-safe checkpoints |
 | **Element CRUD** | Declarative re-send with delete markers | Full create / read / update / delete per element |
 | **AI sees the canvas** | No | `describe` (structured text) + `screenshot` (image) |
 | **Iterative refinement** | Regenerate from checkpoint | Draw → look → adjust → look again, element by element |
@@ -230,7 +230,23 @@ The MCP server runs over stdio. Since v1.1 the simplest config is `npx` — no c
 | `ENABLE_CANVAS_SYNC` | Enable real-time canvas sync | `true` |
 | `EXCALIDRAW_NO_AUTOSTART` | Set `1` to disable canvas auto-start | (unset) |
 | `EXCALIDRAW_EXPORT_DIR` | Base directory MCP file exports may write to | current working dir |
+| `EXCALIDRAW_DATA_DIR` | Optional durable canvas data directory | (unset; in-memory) |
 | `PORT` / `HOST` | Canvas server bind address | `3000` / `127.0.0.1` |
+
+#### Durable canvas state
+
+Set `EXCALIDRAW_DATA_DIR` to keep elements, image files, named snapshots, and the scene revision across canvas-server restarts:
+
+```bash
+EXCALIDRAW_DATA_DIR=/absolute/private/canvas-data \
+  npx -y mcp-excalidraw-server start
+```
+
+The directory contains `canvas-state-v1.json` and a single-owner `canvas-state.lock`. It is created at startup, and a second canvas-server process cannot use the same directory concurrently. Each accepted mutation writes a sibling temporary file, flushes it, and atomically renames it over the checkpoint before the API acknowledges the change. A missing checkpoint starts as an empty canvas. Invalid JSON or an unsupported checkpoint schema stops startup instead of silently replacing recoverable state with an empty scene. Network filesystems and multiple writers are not supported.
+
+The browser and server also exchange a state epoch and scene revision. Full-scene sync uses compare-and-swap: a tab that has fallen behind receives `409 Conflict` plus the authoritative scene and refreshes instead of overwriting newer work. Authoritative empty scenes are applied too, so an older tab cannot repopulate a deliberately cleared canvas.
+
+> **Privacy note:** the checkpoint can contain the full diagram and embedded image data. Keep the data directory outside a repository or other shared directory and restrict access as you would for the source diagram. In Docker, mount the directory as a writable volume (for example `/data`) and set `EXCALIDRAW_DATA_DIR=/data` if it must survive container replacement.
 
 ---
 
@@ -551,7 +567,7 @@ Only for rendering-dependent features: screenshots, PNG/SVG export, viewport con
 
 ### Are my diagrams persistent?
 
-The canvas is in-memory by design (restart = blank canvas). Persist by exporting `.excalidraw` files into your repo (`export --out docs/architecture.excalidraw`) or with named `snapshot`s while working. Re-`import` a file to keep refining it later.
+By default the canvas is in-memory (restart = blank canvas). Set `EXCALIDRAW_DATA_DIR` for automatic restart recovery, including elements, embedded files, and named snapshots. For portable, reviewable artifacts, continue exporting `.excalidraw` files into your repo (`export --out docs/architecture.excalidraw`) and re-import them when needed.
 
 ### Are excalidraw.com share links private?
 
@@ -574,7 +590,7 @@ Yes — that's the recommended path for coding agents: `npx -y mcp-excalidraw-se
 
 ## Known Issues / TODO
 
-- [ ] **Persistent storage**: Elements are stored in-memory — restarting the server clears everything. Use `export` / snapshots as a workaround.
+- [x] **Optional persistent storage**: set `EXCALIDRAW_DATA_DIR` for atomic restart-safe checkpoints; the default remains in-memory.
 - [ ] **Image export requires a browser**: screenshots and image export rely on the frontend doing the actual rendering. A headless rendering mode is planned.
 
 Contributions welcome!

@@ -57,10 +57,14 @@ interface ServerElement {
 
 interface WebSocketMessage {
   type: string;
+  stateId?: string;
+  sceneRevision?: number;
   element?: ServerElement;
   elements?: ServerElement[];
   elementId?: string;
+  files?: Record<string, unknown> | unknown[];
   count?: number;
+  elementCount?: number;
   timestamp?: string;
   source?: string;
   mermaidDiagram?: string;
@@ -77,6 +81,8 @@ interface WebSocketMessage {
 
 interface ApiResponse {
   success: boolean;
+  stateId?: string;
+  sceneRevision?: number;
   elements?: ServerElement[];
   element?: ServerElement;
   files?: Record<string, unknown>;
@@ -85,8 +91,20 @@ interface ApiResponse {
   message?: string;
 }
 
-type SyncStatus = 'idle' | 'syncing' | 'success' | 'error';
+type SyncStatus = 'idle' | 'syncing' | 'success' | 'error' | 'conflict';
 const AUTO_SYNC_DEBOUNCE_MS = 1200;
+const CONFLICT_DRAFT_STORAGE_KEY = 'excalidraw-conflicted-scene-draft';
+
+const sceneElementSignature = (elements: readonly Partial<ExcalidrawElement>[]): string => {
+  return elements.map(element => {
+    const versioned = element as Partial<ExcalidrawElement> & {
+      version?: number;
+      versionNonce?: number;
+      isDeleted?: boolean;
+    }
+    return `${versioned.id}:${versioned.version ?? 0}:${versioned.versionNonce ?? 0}:${versioned.isDeleted ? 1 : 0}`
+  }).join('|')
+}
 
 // Helper function to clean elements for Excalidraw
 const cleanElementForExcalidraw = (element: ServerElement): Partial<ExcalidrawElement> => {
@@ -330,8 +348,22 @@ function App(): JSX.Element {
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null)
   const autoSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const syncInFlightRef = useRef<boolean>(false)
+  const syncQueuedRef = useRef<boolean>(false)
   const suppressAutoSyncCountRef = useRef<number>(0)
   const userInteractedRef = useRef<boolean>(false)
+  const stateIdRef = useRef<string | null>(null)
+  const sceneRevisionRef = useRef<number>(0)
+  const conflictDraftRef = useRef<ServerElement[] | null>(null)
+  const restoringConflictDraftRef = useRef<boolean>(false)
+  const authoritativeSceneSignatureRef = useRef<string | null>(null)
+  const [hasConflictDraft, setHasConflictDraft] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false
+    try {
+      return Boolean(window.localStorage?.getItem(CONFLICT_DRAFT_STORAGE_KEY))
+    } catch {
+      return false
+    }
+  })
 
   const applySceneUpdateWithoutAutoSync = (
     api: ExcalidrawImperativeAPI,
@@ -342,6 +374,132 @@ function App(): JSX.Element {
     setTimeout(() => {
       suppressAutoSyncCountRef.current = Math.max(0, suppressAutoSyncCountRef.current - 1)
     }, 0)
+  }
+
+  const setAuthoritativeVersion = (stateId: unknown, sceneRevision: unknown): void => {
+    if (typeof stateId === 'string' &&
+        stateId.length > 0 &&
+        Number.isSafeInteger(sceneRevision) &&
+        (sceneRevision as number) >= 0) {
+      stateIdRef.current = stateId
+      sceneRevisionRef.current = sceneRevision as number
+    }
+  }
+
+  const shouldApplyAuthoritativeVersion = (stateId: unknown, sceneRevision: unknown): boolean => {
+    if (typeof stateId !== 'string' ||
+        stateId.length === 0 ||
+        !Number.isSafeInteger(sceneRevision) ||
+        (sceneRevision as number) < 0) {
+      return true
+    }
+
+    const revision = sceneRevision as number
+    if (stateIdRef.current === stateId && revision < sceneRevisionRef.current) {
+      return false
+    }
+
+    stateIdRef.current = stateId
+    sceneRevisionRef.current = revision
+    return true
+  }
+
+  const prepareIncrementalVersion = async (stateId: unknown, sceneRevision: unknown): Promise<boolean> => {
+    if (typeof stateId !== 'string' ||
+        stateId.length === 0 ||
+        !Number.isSafeInteger(sceneRevision) ||
+        (sceneRevision as number) < 0) {
+      return true
+    }
+
+    const revision = sceneRevision as number
+    if (stateIdRef.current !== null && stateIdRef.current !== stateId) {
+      await loadExistingElements()
+      return false
+    }
+    if (stateIdRef.current === stateId && revision < sceneRevisionRef.current) {
+      return false
+    }
+    if (stateIdRef.current === stateId && revision > sceneRevisionRef.current + 1) {
+      await loadExistingElements()
+      return false
+    }
+
+    stateIdRef.current = stateId
+    sceneRevisionRef.current = revision
+    return true
+  }
+
+  const applyAuthoritativeElements = (
+    api: ExcalidrawImperativeAPI,
+    serverElements: ServerElement[]
+  ): void => {
+    const cleanedElements = serverElements.map(cleanElementForExcalidraw)
+    const convertedElements = convertElementsPreservingImageProps(cleanedElements)
+    authoritativeSceneSignatureRef.current = sceneElementSignature(convertedElements)
+    applySceneUpdateWithoutAutoSync(api, {
+      elements: convertedElements,
+      captureUpdate: CaptureUpdateAction.NEVER
+    })
+  }
+
+  const applyAuthoritativeScene = (
+    api: ExcalidrawImperativeAPI,
+    result: ApiResponse | WebSocketMessage
+  ): void => {
+    if (result.files && !Array.isArray(result.files)) {
+      api.addFiles(Object.values(result.files) as any)
+    }
+    if (Array.isArray(result.elements)) {
+      applyAuthoritativeElements(api, result.elements)
+    }
+  }
+
+  const preserveConflictDraft = (draft: ServerElement[]): void => {
+    conflictDraftRef.current = draft
+    setHasConflictDraft(true)
+    try {
+      window.localStorage?.setItem(CONFLICT_DRAFT_STORAGE_KEY, JSON.stringify({
+        savedAt: new Date().toISOString(),
+        elements: draft
+      }))
+    } catch (error) {
+      console.warn('Could not persist the conflicted local draft:', error)
+    }
+  }
+
+  const clearConflictDraft = (): void => {
+    conflictDraftRef.current = null
+    setHasConflictDraft(false)
+    try {
+      window.localStorage?.removeItem(CONFLICT_DRAFT_STORAGE_KEY)
+    } catch (error) {
+      console.warn('Could not remove the conflicted local draft:', error)
+    }
+  }
+
+  const restoreConflictDraft = (): void => {
+    const api = excalidrawAPIRef.current
+    if (!api) return
+
+    let draft = conflictDraftRef.current
+    if (!draft) {
+      try {
+        const stored = window.localStorage?.getItem(CONFLICT_DRAFT_STORAGE_KEY)
+        const parsed = stored ? JSON.parse(stored) : null
+        if (Array.isArray(parsed?.elements)) {
+          draft = parsed.elements
+        }
+      } catch (error) {
+        console.warn('Could not read the conflicted local draft:', error)
+      }
+    }
+    if (!draft) return
+
+    applyAuthoritativeElements(api, draft)
+    restoringConflictDraftRef.current = true
+    userInteractedRef.current = false
+    setSyncStatus('idle')
   }
 
   useEffect(() => {
@@ -376,26 +534,15 @@ function App(): JSX.Element {
 
   const loadExistingElements = async (): Promise<void> => {
     try {
-      const response = await fetch('/api/elements')
+      const response = await fetch('/api/scene')
       const result: ApiResponse = await response.json()
 
-      if (result.success && result.elements && result.elements.length > 0) {
-        const cleanedElements = result.elements.map(cleanElementForExcalidraw)
-        const convertedElements = convertElementsPreservingImageProps(cleanedElements)
-        if (excalidrawAPI) {
-          applySceneUpdateWithoutAutoSync(excalidrawAPI, {
-            elements: convertedElements,
-            captureUpdate: CaptureUpdateAction.NEVER
-          })
-        }
-      }
-
-      const filesResponse = await fetch('/api/files')
-      if (filesResponse.ok) {
-        const filesResult = await filesResponse.json() as ApiResponse
-        if (filesResult.files) {
-          excalidrawAPI?.addFiles(Object.values(filesResult.files))
-        }
+      const api = excalidrawAPIRef.current
+      if (result.success && Array.isArray(result.elements) && api) {
+        setAuthoritativeVersion(result.stateId, result.sceneRevision)
+        // Empty is authoritative too: a restarted or intentionally-cleared
+        // server must not be repopulated by an older browser scene.
+        applyAuthoritativeScene(api, result)
       }
     } catch (error) {
       console.error('Error loading existing elements:', error)
@@ -477,6 +624,7 @@ function App(): JSX.Element {
         mergedElements.push(...incomingById.values())
 
         const convertedElements = convertElementsPreservingImageProps(mergedElements)
+        authoritativeSceneSignatureRef.current = sceneElementSignature(convertedElements)
         applySceneUpdateWithoutAutoSync(excalidrawAPI, {
           elements: convertedElements,
           captureUpdate: CaptureUpdateAction.NEVER
@@ -485,28 +633,27 @@ function App(): JSX.Element {
 
       switch (data.type) {
         case 'initial_elements':
-          if (data.elements && data.elements.length > 0) {
-            const cleanedElements = data.elements.map(cleanElementForExcalidraw)
-            const convertedElements = convertElementsPreservingImageProps(cleanedElements)
-            applySceneUpdateWithoutAutoSync(excalidrawAPI, {
-              elements: convertedElements,
-              captureUpdate: CaptureUpdateAction.NEVER
-            })
-          }
-          // Load files for image elements
-          if ((data as any).files) {
-            excalidrawAPI.addFiles(Object.values((data as any).files))
+          if (Array.isArray(data.elements)) {
+            setAuthoritativeVersion(data.stateId, data.sceneRevision)
+            applyAuthoritativeScene(excalidrawAPI, data)
           }
           break
 
         case 'files_added':
-          if (Array.isArray((data as any).files)) {
+          if (Array.isArray((data as any).files) &&
+              await prepareIncrementalVersion(data.stateId, data.sceneRevision)) {
             excalidrawAPI.addFiles((data as any).files)
           }
           break
 
+        case 'file_deleted':
+          if (await prepareIncrementalVersion(data.stateId, data.sceneRevision)) {
+            await loadExistingElements()
+          }
+          break
+
         case 'element_created':
-          if (data.element) {
+          if (data.element && await prepareIncrementalVersion(data.stateId, data.sceneRevision)) {
             const cleanedNewElement = cleanElementForExcalidraw(data.element)
             // Rebuild against full scene so text/container bindings remain intact.
             mergeAndApplySceneElements([cleanedNewElement])
@@ -514,7 +661,7 @@ function App(): JSX.Element {
           break
 
         case 'element_updated':
-          if (data.element) {
+          if (data.element && await prepareIncrementalVersion(data.stateId, data.sceneRevision)) {
             const cleanedUpdatedElement = cleanElementForExcalidraw(data.element)
             // Convert with full scene context so text metrics/container placement can refresh.
             mergeAndApplySceneElements([cleanedUpdatedElement])
@@ -522,8 +669,9 @@ function App(): JSX.Element {
           break
 
         case 'element_deleted':
-          if (data.elementId) {
+          if (data.elementId && await prepareIncrementalVersion(data.stateId, data.sceneRevision)) {
             const filteredElements = currentElements.filter(el => el.id !== data.elementId)
+            authoritativeSceneSignatureRef.current = sceneElementSignature(filteredElements)
             applySceneUpdateWithoutAutoSync(excalidrawAPI, {
               elements: filteredElements,
               captureUpdate: CaptureUpdateAction.NEVER
@@ -532,7 +680,7 @@ function App(): JSX.Element {
           break
 
         case 'elements_batch_created':
-          if (data.elements) {
+          if (data.elements && await prepareIncrementalVersion(data.stateId, data.sceneRevision)) {
             const cleanedBatchElements = data.elements.map(cleanElementForExcalidraw)
             mergeAndApplySceneElements(cleanedBatchElements)
           }
@@ -540,19 +688,20 @@ function App(): JSX.Element {
 
         case 'elements_synced':
           console.log(`Sync confirmed by server: ${data.count} elements`)
-          // Sync confirmation already handled by HTTP response
+          if (Array.isArray(data.elements) && shouldApplyAuthoritativeVersion(data.stateId, data.sceneRevision)) {
+            applyAuthoritativeScene(excalidrawAPI, data)
+          }
           break
 
         case 'sync_status':
-          console.log(`Server sync status: ${data.count} elements`)
+          console.log(`Server sync status: ${data.elementCount} elements`)
           break
 
         case 'canvas_cleared':
           console.log('Canvas cleared by server')
-          applySceneUpdateWithoutAutoSync(excalidrawAPI, {
-            elements: [],
-            captureUpdate: CaptureUpdateAction.NEVER
-          })
+          if (shouldApplyAuthoritativeVersion(data.stateId, data.sceneRevision)) {
+            applyAuthoritativeElements(excalidrawAPI, [])
+          }
           break
 
         case 'export_image_request':
@@ -802,8 +951,16 @@ function App(): JSX.Element {
       console.warn('Excalidraw API not available')
       return
     }
+    if (!stateIdRef.current) {
+      console.warn('Canvas authority version is not available yet')
+      if (!silent) {
+        setSyncStatus('error')
+      }
+      return
+    }
 
     if (syncInFlightRef.current) {
+      syncQueuedRef.current = true
       return
     }
 
@@ -836,12 +993,19 @@ function App(): JSX.Element {
         },
         body: JSON.stringify({
           elements: backendElements,
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
+          baseStateId: stateIdRef.current,
+          baseRevision: sceneRevisionRef.current
         })
       })
 
+      const result: ApiResponse = await response.json()
       if (response.ok) {
-        const result: ApiResponse = await response.json()
+        shouldApplyAuthoritativeVersion(result.stateId, result.sceneRevision)
+        if (restoringConflictDraftRef.current) {
+          restoringConflictDraftRef.current = false
+          clearConflictDraft()
+        }
         setLastSyncTime(new Date())
         console.log(`Sync successful: ${result.count} elements synced`)
 
@@ -850,9 +1014,19 @@ function App(): JSX.Element {
           // Reset status after 2 seconds
           setTimeout(() => setSyncStatus('idle'), 2000)
         }
+      } else if (response.status === 409 && Array.isArray(result.elements)) {
+        // The server scene changed after this tab last observed it. Adopt the
+        // authoritative replacement, but keep the rejected local scene so the
+        // user can explicitly recover it instead of losing unsent edits.
+        preserveConflictDraft(backendElements)
+        if (shouldApplyAuthoritativeVersion(result.stateId, result.sceneRevision)) {
+          applyAuthoritativeScene(api, result)
+        }
+        console.warn('Canvas changed elsewhere; refreshed the authoritative scene')
+        setSyncStatus('conflict')
+        syncQueuedRef.current = false
       } else {
-        const error: ApiResponse = await response.json()
-        console.error('Sync failed:', error.error)
+        console.error('Sync failed:', result.error)
         if (!silent) {
           setSyncStatus('error')
         }
@@ -864,11 +1038,15 @@ function App(): JSX.Element {
       }
     } finally {
       syncInFlightRef.current = false
+      if (syncQueuedRef.current) {
+        syncQueuedRef.current = false
+        setTimeout(() => void syncToBackend({ silent: true }), 0)
+      }
     }
   }
 
   const scheduleAutoSync = (): void => {
-    if (!isConnected || !excalidrawAPI) {
+    if (!isConnected || !excalidrawAPI || !stateIdRef.current) {
       return
     }
     if (!userInteractedRef.current) {
@@ -883,7 +1061,11 @@ function App(): JSX.Element {
 
     autoSyncTimerRef.current = setTimeout(() => {
       autoSyncTimerRef.current = null
-      if (suppressAutoSyncCountRef.current > 0 || syncInFlightRef.current) {
+      if (suppressAutoSyncCountRef.current > 0) {
+        return
+      }
+      if (syncInFlightRef.current) {
+        syncQueuedRef.current = true
         return
       }
       void syncToBackend({ silent: true })
@@ -893,29 +1075,16 @@ function App(): JSX.Element {
   const clearCanvas = async (): Promise<void> => {
     if (excalidrawAPI) {
       try {
-        // Get all current elements and delete them from backend
-        const response = await fetch('/api/elements')
+        const response = await fetch('/api/elements/clear', { method: 'DELETE' })
         const result: ApiResponse = await response.json()
-
-        if (result.success && result.elements) {
-          const deletePromises = result.elements.map(element =>
-            fetch(`/api/elements/${element.id}`, { method: 'DELETE' })
-          )
-          await Promise.all(deletePromises)
+        if (!response.ok || !result.success) {
+          throw new Error(result.error || `Clear failed with HTTP ${response.status}`)
         }
-
-        // Clear the frontend canvas
-        applySceneUpdateWithoutAutoSync(excalidrawAPI, {
-          elements: [],
-          captureUpdate: CaptureUpdateAction.IMMEDIATELY
-        })
+        shouldApplyAuthoritativeVersion(result.stateId, result.sceneRevision)
+        applyAuthoritativeElements(excalidrawAPI, [])
       } catch (error) {
         console.error('Error clearing canvas:', error)
-        // Still clear frontend even if backend fails
-        applySceneUpdateWithoutAutoSync(excalidrawAPI, {
-          elements: [],
-          captureUpdate: CaptureUpdateAction.IMMEDIATELY
-        })
+        setSyncStatus('error')
       }
     }
   }
@@ -950,12 +1119,20 @@ function App(): JSX.Element {
               {syncStatus === 'error' && (
                 <span className="sync-error">❌ Sync Failed</span>
               )}
+              {syncStatus === 'conflict' && (
+                <span className="sync-error">⚠️ Newer server scene loaded; local draft preserved</span>
+              )}
               {lastSyncTime && syncStatus === 'idle' && (
                 <span className="sync-time">
                   Last sync: {formatSyncTime(lastSyncTime)}
                 </span>
               )}
             </div>
+            {hasConflictDraft && (
+              <button className="btn-secondary" onClick={restoreConflictDraft}>
+                Restore local draft
+              </button>
+            )}
           </div>
 
           <button className="btn-secondary" onClick={clearCanvas}>Clear Canvas</button>
@@ -983,6 +1160,9 @@ function App(): JSX.Element {
                 } catch (error) {
                   console.warn('Failed to save theme to localStorage:', error)
                 }
+              }
+              if (authoritativeSceneSignatureRef.current === sceneElementSignature(_elements)) {
+                return
               }
               scheduleAutoSync()
             }}

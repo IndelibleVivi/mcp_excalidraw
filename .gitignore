@@ -19,6 +19,10 @@ public/dist/
 
 # Development artifacts
 *.excalidraw
+canvas-state.json
+canvas-state-v1.json
+canvas-state.lock
+.excalidraw-state/
 
 .DS_Store
 
