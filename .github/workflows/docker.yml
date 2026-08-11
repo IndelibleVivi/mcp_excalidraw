@@ -17,6 +17,7 @@ env:
 jobs:
   build-and-push-mcp:
     name: Build and Push MCP Server Image
+    if: github.repository == 'yctimlin/mcp_excalidraw'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -64,6 +65,7 @@ jobs:
 
   build-and-push-canvas:
     name: Build and Push Canvas Server Image
+    if: github.repository == 'yctimlin/mcp_excalidraw'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -111,6 +113,7 @@ jobs:
 
   test-docker-images:
     name: Test Docker Images
+    if: github.repository == 'yctimlin/mcp_excalidraw'
     needs: [build-and-push-mcp, build-and-push-canvas]
     runs-on: ubuntu-latest
 

@@ -11,10 +11,11 @@
 > The unscoped npm package and GHCR images referenced in the upstream documentation below
 > are still upstream releases and **do not yet contain this fork's reliability changes**.
 > To use the fork today, follow [Using This Fork](#using-this-fork) and build from source.
+> Inherited npm and container publishing jobs are repository-gated to upstream and cannot publish
+> artifacts from this fork without a separate distribution decision.
 
-[![CI](https://github.com/yctimlin/mcp_excalidraw/actions/workflows/ci.yml/badge.svg)](https://github.com/yctimlin/mcp_excalidraw/actions/workflows/ci.yml)
-[![Docker Build & Push](https://github.com/yctimlin/mcp_excalidraw/actions/workflows/docker.yml/badge.svg)](https://github.com/yctimlin/mcp_excalidraw/actions/workflows/docker.yml)
-[![NPM Version](https://img.shields.io/npm/v/mcp-excalidraw-server)](https://www.npmjs.com/package/mcp-excalidraw-server)
+[![Fork CI](https://github.com/IndelibleVivi/mcp_excalidraw/actions/workflows/ci.yml/badge.svg)](https://github.com/IndelibleVivi/mcp_excalidraw/actions/workflows/ci.yml)
+[![Upstream NPM Version](https://img.shields.io/npm/v/mcp-excalidraw-server)](https://www.npmjs.com/package/mcp-excalidraw-server)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **mcp-excalidraw-server** gives AI agents a live [Excalidraw](https://excalidraw.com) canvas they can draw on, look at, refine, and save into your repo. Your agent creates architecture diagrams and flowcharts programmatically, **sees its own work via screenshots**, fixes layout problems, and exports `.excalidraw` files you can commit next to your code.

@@ -34,7 +34,9 @@ There is currently no fork-specific npm package or container image. The unscoped
 this fork from source until a separately named and tested distribution is published.
 
 The fork's `package.json` is marked `private` to prevent accidental publication under the upstream
-package name. A future fork package must use its own scoped identity and release notes.
+package name. Inherited npm and container publishing jobs are also repository-gated to
+`yctimlin/mcp_excalidraw`, so a fork push cannot mint packages or images. A future fork package
+must use its own scoped identity and release notes.
 
 ## Maintenance policy
 

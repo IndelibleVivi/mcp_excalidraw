@@ -37,6 +37,9 @@ jobs:
       - name: Run MCP stdio wire tests
         run: node scripts/check-mcp-stdio.mjs
 
+      - name: Run durable canvas state integration tests
+        run: npm run test:state
+
       - name: Check build artifacts
         run: |
           echo "Checking if build artifacts exist..."
