@@ -169,12 +169,15 @@ async function seedFrameSnapshot(name) {
   await request('/api/elements', { method: 'POST', ...json({ id: 'later', type: 'ellipse', x: 0, y: 0 }) });
 }
 
-// A snapshot holding a type the batch schema rejects must leave the canvas as is.
+// A snapshot holding a type outside Excalidraw's element union must leave the
+// canvas as is. (Native scene-only types like embeddable are valid scene data
+// and DO round-trip through the batch/replace path, so this fixture uses a
+// genuinely unknown type.)
 async function seedUnsupportedSnapshot(name) {
   await request('/api/elements/clear', { method: 'DELETE' });
   await request('/api/elements/sync', {
     method: 'POST',
-    ...json({ elements: [{ id: 'web', type: 'embeddable', x: 0, y: 0, width: 300, height: 200 }] }),
+    ...json({ elements: [{ id: 'web', type: 'not-a-real-type', x: 0, y: 0, width: 300, height: 200 }] }),
   });
   await request('/api/snapshots', { method: 'POST', ...json({ name }) });
   await request('/api/elements/clear', { method: 'DELETE' });

@@ -13,6 +13,7 @@ import {
   snapshots,
   generateId,
   EXCALIDRAW_ELEMENT_TYPES,
+  EXCALIDRAW_SCENE_ELEMENT_TYPES,
   ServerElement,
   ExcalidrawElementType,
   ExcalidrawFile,
@@ -38,6 +39,7 @@ import {
   acquireDurableStateLock,
   commitCanvasMutation,
   durableStatePath,
+  inferDataURLMimeType,
   loadDurableState,
   releaseDurableStateLock,
 } from './core/canvas-persistence.js';
@@ -132,7 +134,11 @@ function prepareFileWrites(fileList: unknown[]): ExcalidrawFile[] {
     const previous = prepared.get(candidate.id) ?? files.get(candidate.id);
     const mimeType = typeof candidate.mimeType === 'string' && candidate.mimeType.length > 0
       ? candidate.mimeType
-      : previous?.mimeType ?? 'image/png';
+      // An omitted mimeType falls back to the existing record, then to the MIME
+      // the dataURL itself declares, and only then to the legacy png default.
+      // Inferring from the payload keeps a valid JPEG upload durable-mode
+      // compatible without weakening the explicit-conflict check below.
+      : previous?.mimeType ?? inferDataURLMimeType(candidate.dataURL) ?? 'image/png';
 
     if (previous) {
       if (previous.dataURL !== candidate.dataURL || previous.mimeType !== mimeType) {
@@ -195,7 +201,11 @@ wss.on('connection', (ws: WebSocket) => {
 // Schema validation
 const CreateElementSchema = z.object({
   id: z.string().optional(), // Allow passing ID for MCP sync
-  type: z.enum(Object.values(EXCALIDRAW_ELEMENT_TYPES) as [ExcalidrawElementType, ...ExcalidrawElementType[]]),
+  // Batch/replace/import accept the full set of bundled Excalidraw scene types,
+  // so a snapshot or import that carries an embeddable/iframe/magicframe
+  // round-trips instead of being rejected. Creation tools keep the narrower
+  // EXCALIDRAW_ELEMENT_TYPES set.
+  type: z.enum(EXCALIDRAW_SCENE_ELEMENT_TYPES as unknown as [ExcalidrawElementType, ...ExcalidrawElementType[]]),
   x: z.number(),
   y: z.number(),
   width: z.number().optional(),

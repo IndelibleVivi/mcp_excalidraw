@@ -106,10 +106,25 @@ export interface ExcalidrawBinding {
   fixedPoint?: readonly [number, number] | null;
 }
 
-export type ExcalidrawElementType = 'rectangle' | 'ellipse' | 'diamond' | 'arrow' | 'text' | 'line' | 'freedraw' | 'image' | 'frame';
+// Types the agent creation surface (MCP tools and CLI `add`) accepts.
+// This is the narrower *creation* contract and must not grow
+// just because the persistence layer learns new types.
+export type ExcalidrawCreationElementType =
+  | 'rectangle' | 'ellipse' | 'diamond' | 'arrow' | 'text'
+  | 'line' | 'freedraw' | 'image' | 'frame';
 
-// Excalidraw element types
-export const EXCALIDRAW_ELEMENT_TYPES: Record<string, ExcalidrawElementType> = {
+// Additional element types a bundled Excalidraw scene can contain (a user can
+// drop an embed/iframe/magic-frame into the live canvas). They are valid scene
+// data and must survive sync, checkpoint/restart, snapshot and import/export
+// round-trips even though the creation API does not build them.
+export type ExcalidrawSceneOnlyElementType = 'embeddable' | 'iframe' | 'magicframe';
+
+export type ExcalidrawElementType =
+  | ExcalidrawCreationElementType
+  | ExcalidrawSceneOnlyElementType;
+
+// Excalidraw element types the creation API builds
+export const EXCALIDRAW_ELEMENT_TYPES: Record<string, ExcalidrawCreationElementType> = {
   RECTANGLE: 'rectangle',
   ELLIPSE: 'ellipse',
   DIAMOND: 'diamond',
@@ -120,6 +135,22 @@ export const EXCALIDRAW_ELEMENT_TYPES: Record<string, ExcalidrawElementType> = {
   IMAGE: 'image',
   FRAME: 'frame'
 } as const;
+
+// Every element type a bundled Excalidraw scene can legally contain. Used by
+// scene persistence and round-trip validation. It is intentionally the full
+// Excalidraw element union — an unknown string is still rejected.
+export const EXCALIDRAW_SCENE_ELEMENT_TYPES: readonly ExcalidrawElementType[] = [
+  ...Object.values(EXCALIDRAW_ELEMENT_TYPES),
+  'embeddable',
+  'iframe',
+  'magicframe'
+];
+
+const SCENE_ELEMENT_TYPE_SET: ReadonlySet<string> = new Set(EXCALIDRAW_SCENE_ELEMENT_TYPES);
+
+export function isSceneElementType(value: unknown): value is ExcalidrawElementType {
+  return typeof value === 'string' && SCENE_ELEMENT_TYPE_SET.has(value);
+}
 
 // Server-side element with metadata
 export interface ServerElement extends Omit<ExcalidrawElementBase, 'id'> {
@@ -327,7 +358,7 @@ export function validateElement(element: Partial<ServerElement>): element is Ser
     throw new Error(`Missing required fields: ${requiredFields.join(', ')}`);
   }
 
-  if (!Object.values(EXCALIDRAW_ELEMENT_TYPES).includes(element.type as ExcalidrawElementType)) {
+  if (!isSceneElementType(element.type)) {
     throw new Error(`Invalid element type: ${element.type}`);
   }
 

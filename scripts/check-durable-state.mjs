@@ -170,6 +170,7 @@ let memoryOnly;
 let memoryOnlyRestart;
 let publicationFailure;
 let failureSocket;
+let nativeTypes;
 
 try {
   process.env.EXPRESS_SERVER_URL = serverUrl(firstPort);
@@ -368,6 +369,107 @@ try {
   );
   await stopCanvas(second);
   second = null;
+
+  // Native Excalidraw scene types (embeddable/iframe/magicframe) are legal scene
+  // data even though the creation API does not build them. Frontend autosync
+  // posts the whole live scene, so they must survive sync -> checkpoint ->
+  // restart -> snapshot round-trip, while the checkpoint still rejects
+  // genuinely unknown types and invalid coordinates.
+  const nativeDirectory = join(fixtureRoot, 'native scene types');
+  nativeTypes = spawnCanvas(nativeDirectory, firstPort + 20);
+  await waitForHealth(nativeTypes);
+  const nativeScene = [
+    { id: 'rect', type: 'rectangle', x: 0, y: 0, width: 120, height: 80 },
+    { id: 'embed', type: 'embeddable', x: 0, y: 0, width: 300, height: 200, link: 'https://example.com', customData: { foo: 1 } },
+    { id: 'frame-iframe', type: 'iframe', x: 0, y: 300, width: 320, height: 240 },
+    { id: 'mf', type: 'magicframe', x: 400, y: 0, width: 200, height: 150, name: 'MF' },
+  ];
+  const nativeSync = await postJson(nativeTypes, '/api/elements/sync', { elements: nativeScene, timestamp: Date.now() });
+  assert.equal(nativeSync.response.status, 200, 'durable sync rejected native scene types');
+  assert.equal(nativeSync.body.count, 4);
+  const nativeAfterSync = await request(nativeTypes, '/api/elements');
+  assert.deepEqual(nativeAfterSync.body.elements.map(element => element.id), ['rect', 'embed', 'frame-iframe', 'mf']);
+  const nativeById = Object.fromEntries(nativeAfterSync.body.elements.map(element => [element.id, element]));
+  assert.equal(nativeById.embed.link, 'https://example.com', 'embeddable fields were not preserved');
+  assert.deepEqual(nativeById.embed.customData, { foo: 1 }, 'embeddable customData was not preserved');
+  assert.equal(nativeById.mf.name, 'MF', 'magicframe fields were not preserved');
+  assert.equal(nativeById['frame-iframe'].type, 'iframe');
+
+  // Snapshot the native scene, clear, then restore through the import (batch replace) path.
+  assert.equal((await postJson(nativeTypes, '/api/snapshots', { name: 'native-snap' })).response.status, 200);
+  await request(nativeTypes, '/api/elements/clear', { method: 'DELETE' });
+  const nativeSnapshot = await request(nativeTypes, '/api/snapshots/native-snap');
+  const nativeRestore = await postJson(nativeTypes, '/api/elements/batch', { elements: nativeSnapshot.body.snapshot.elements, replace: true });
+  assert.equal(nativeRestore.response.status, 200, 'snapshot restore rejected native scene types');
+  const nativeRestored = await request(nativeTypes, '/api/elements');
+  assert.deepEqual(nativeRestored.body.elements.map(element => element.id), ['rect', 'embed', 'frame-iframe', 'mf']);
+  assert.equal(nativeRestored.body.elements.find(element => element.id === 'embed').link, 'https://example.com');
+
+  // An omitted mimeType is inferred from the dataURL payload (durable mode must
+  // not reject a valid JPEG upload just because the caller left it out), while
+  // an explicit mismatch is still refused.
+  const inferredMime = await postJson(nativeTypes, '/api/files', [
+    { id: 'jpeg-inferred', dataURL: 'data:image/jpeg;base64,QUJD', created: 9 },
+  ]);
+  assert.equal(inferredMime.response.status, 200, 'durable mode rejected a JPEG upload with no mimeType');
+  const inferredFiles = await request(nativeTypes, '/api/files');
+  assert.equal(inferredFiles.body.files['jpeg-inferred'].mimeType, 'image/jpeg', 'omitted mimeType was not inferred from the dataURL');
+  const conflictedMime = await postJson(nativeTypes, '/api/files', [
+    { id: 'jpeg-inferred', dataURL: 'data:image/png;base64,QUJD', mimeType: 'image/png', created: 9 },
+  ]);
+  assert.equal(conflictedMime.response.status, 409, 'immutable file id was allowed to change bytes');
+
+  const beforeMimeMismatch = readFileSync(join(nativeDirectory, 'canvas-state-v1.json'), 'utf8');
+  const explicitMimeMismatch = await postJson(nativeTypes, '/api/files', [
+    { id: 'wrong-mime', dataURL: 'data:image/jpeg;base64,QUJD', mimeType: 'image/png', created: 10 },
+  ]);
+  assert.equal(explicitMimeMismatch.response.ok, false, 'explicit MIME mismatch was not rejected');
+  assert.equal(readFileSync(join(nativeDirectory, 'canvas-state-v1.json'), 'utf8'), beforeMimeMismatch);
+  assert.equal('wrong-mime' in (await request(nativeTypes, '/api/files')).body.files, false);
+
+  // Fail-closed guarantees still hold: unknown type and non-numeric coordinates.
+  const beforeNativeReject = readFileSync(join(nativeDirectory, 'canvas-state-v1.json'), 'utf8');
+  const unknownType = await postJson(nativeTypes, '/api/elements/sync', {
+    elements: [
+      { id: 'ok', type: 'rectangle', x: 0, y: 0, width: 5, height: 5 },
+      { id: 'bogus', type: 'not-a-real-type', x: 0, y: 0 },
+    ],
+    timestamp: Date.now(),
+  });
+  assert.equal(unknownType.response.status, 500, 'unknown element type was not rejected');
+  const badCoords = await postJson(nativeTypes, '/api/elements/sync', {
+    elements: [{ id: 'bad-num', type: 'embeddable', x: 'nope', y: 0 }],
+    timestamp: Date.now(),
+  });
+  assert.equal(badCoords.response.status, 500, 'non-numeric coordinates were not rejected');
+  assert.equal(
+    readFileSync(join(nativeDirectory, 'canvas-state-v1.json'), 'utf8'),
+    beforeNativeReject,
+    'rejected native sync changed the checkpoint',
+  );
+  const nativeSurvivors = await request(nativeTypes, '/api/elements');
+  assert.deepEqual(
+    nativeSurvivors.body.elements.map(element => element.id),
+    ['rect', 'embed', 'frame-iframe', 'mf'],
+    'rejected sync changed the live scene',
+  );
+
+  await stopCanvas(nativeTypes);
+  nativeTypes = spawnCanvas(nativeDirectory, firstPort + 20);
+  await waitForHealth(nativeTypes);
+  const nativeReloaded = await request(nativeTypes, '/api/elements');
+  assert.deepEqual(
+    nativeReloaded.body.elements.map(element => element.id),
+    ['rect', 'embed', 'frame-iframe', 'mf'],
+    'restart lost native scene types',
+  );
+  assert.equal(
+    nativeReloaded.body.elements.find(element => element.id === 'embed').link,
+    'https://example.com',
+    'restart lost native element fields',
+  );
+  await stopCanvas(nativeTypes);
+  nativeTypes = null;
 
   const missingState = JSON.parse(readFileSync(join(missingBlobDirectory, 'canvas-state-v1.json'), 'utf8'));
   unlinkSync(join(missingBlobDirectory, missingState.files[0].blob));
@@ -667,7 +769,8 @@ try {
     'blob-first publication, immutable file identities, deterministic serialization, single-writer locking, ' +
     'rollback on write failure, no failure broadcasts, post-publication failure fencing, ' +
     'strict fail-closed loading, memory-only compatibility, files, snapshots, ' +
-    'permissions, and no per-mutation image payload rewrite.'
+    'native scene types round-tripping through sync/checkpoint/restart/snapshot, ' +
+    'mime inference for omitted file mimeTypes, permissions, and no per-mutation image payload rewrite.'
   );
 } catch (error) {
   console.error(error instanceof Error ? error.stack || error.message : String(error));
@@ -678,6 +781,7 @@ try {
   if (memoryOnlyRestart) await stopCanvas(memoryOnlyRestart).catch(error => console.error(error.message));
   if (memoryOnly) await stopCanvas(memoryOnly).catch(error => console.error(error.message));
   if (writeFailure) await stopCanvas(writeFailure).catch(error => console.error(error.message));
+  if (nativeTypes) await stopCanvas(nativeTypes).catch(error => console.error(error.message));
   if (second) await stopCanvas(second).catch(error => console.error(error.message));
   if (lockContender) await stopCanvas(lockContender).catch(error => console.error(error.message));
   if (first) await stopCanvas(first).catch(error => console.error(error.message));

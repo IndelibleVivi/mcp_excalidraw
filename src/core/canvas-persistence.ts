@@ -20,7 +20,7 @@ import {
   elements,
   files,
   snapshots,
-  EXCALIDRAW_ELEMENT_TYPES,
+  isSceneElementType,
 } from '../types.js';
 import type {
   ExcalidrawFile,
@@ -34,7 +34,15 @@ const LOCK_FILE_NAME = 'canvas-state.lock';
 const BLOB_DIRECTORY_NAME = 'blobs';
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const DATA_URL_MIME_PATTERN = /^data:([^;,]+)(?:;[^,]*)?,/i;
-const VALID_ELEMENT_TYPES = new Set<string>(Object.values(EXCALIDRAW_ELEMENT_TYPES));
+
+// Extract the MIME type a data URL declares, or null when it is not a
+// well-formed `data:<mime>[;...],` URL. Callers use this to fill in an omitted
+// `mimeType` from the payload instead of guessing a default.
+export function inferDataURLMimeType(dataURL: unknown): string | null {
+  if (typeof dataURL !== 'string') return null;
+  const match = DATA_URL_MIME_PATTERN.exec(dataURL);
+  return match ? match[1]!.toLowerCase() : null;
+}
 
 interface DurableFileRecordV1 {
   id: string;
@@ -670,7 +678,7 @@ function validateElementArray(value: unknown, label: string): ServerElement[] {
   for (const element of value) {
     if (!isRecord(element) ||
         typeof element.id !== 'string' || element.id.length === 0 ||
-        typeof element.type !== 'string' || !VALID_ELEMENT_TYPES.has(element.type) ||
+        !isSceneElementType(element.type) ||
         typeof element.x !== 'number' || !Number.isFinite(element.x) ||
         typeof element.y !== 'number' || !Number.isFinite(element.y)) {
       throw new Error(`${label} contains an invalid element`);

@@ -286,6 +286,8 @@ If the checkpoint has already been renamed into place but the final directory fl
 
 The data-directory lock grants one process exclusive ownership of that durable state, including when servers use different ports. It stores one token-specific owner file so stale-lock reclamation cannot delete a newer owner's evidence. The existing pidfile has a separate job: it identifies a listening process for `start` / `stop` lifecycle commands. Local filesystems and one writer are supported; network filesystems, shared multi-writer access, automatic blob garbage collection, databases, and cloud persistence are out of scope.
 
+Durable state stores the whole scene, including element types the creation API does not build (`embeddable`, `iframe`, `magicframe`). A browser tab can draw those, and its autosync must persist them; the MCP/CLI creation tools still build only the agent-oriented types (`rectangle`, `ellipse`, `diamond`, `arrow`, `line`, `text`, `freedraw`, `image`, `frame`). An element type outside Excalidraw's full element union is still rejected and rolls the mutation back.
+
 > **Privacy:** durable state contains the diagram and embedded image payloads. Keep the directory outside repositories and shared folders, restrict its permissions, and mount it as a private writable volume when using containers.
 
 ---
